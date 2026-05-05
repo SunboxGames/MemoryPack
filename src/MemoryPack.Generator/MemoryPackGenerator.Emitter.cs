@@ -269,6 +269,7 @@ public partial class TypeMeta
 
         var serializeBody = "";
         var deserializeBody = "";
+        var circularSerializeBodyMethod = "";
         if (IsUnmanagedType)
         {
             serializeBody = $$"""
@@ -298,6 +299,17 @@ public partial class TypeMeta
 
             serializeBody = EmitSerializeBody(context.IsForUnity);
             deserializeBody = EmitDeserializeBody();
+
+            // For CircularReference: also emit the body-only SerializeBody method (called both
+            // inline from Serialize and from the deferred-drain dispatcher) and a singleton
+            // dispatcher class that the writer's defer queue uses to invoke SerializeBody.
+            if (GenerateType == GenerateType.CircularReference)
+            {
+                bool optimized = Members.All(x => x.Kind is MemberKind.Unmanaged or MemberKind.String or MemberKind.Enum or MemberKind.UnmanagedArray or MemberKind.UnmanagedNullable or MemberKind.Blank);
+                circularSerializeBodyMethod = optimized
+                    ? EmitCircularReferenceSerializeBodyOptimized()
+                    : EmitCircularReferenceSerializeBody(context.IsForUnity);
+            }
 
             Members = originalMembers;
         }
@@ -425,6 +437,32 @@ partial {{classOrStructOrRecord}} {{TypeName}} : IMemoryPackable<{{TypeName}}>{{
 {{OnDeserialized.Select(x => "        " + x.Emit()).NewLine()}}
         return;
     }
+{{(GenerateType == GenerateType.CircularReference ? $$"""
+
+    // Body-only writer for CircularReference. Skips the cycle/defer guard so it can be invoked
+    // both from Serialize (when depth is below MaxDepth) and from the deferred-drain dispatcher.
+    // Constraint mirrors the existing Serialize method: pre-NET7 / Unity needs `class` because
+    // ref-struct generic constraints weren't loosened until NET7.
+    [global::MemoryPack.Internal.Preserve]
+    public static void SerializeBody{{(context.IsForUnity ? "" : "<TBufferWriter>")}}(ref {{(context.IsForUnity ? "MemoryPackWriter" : "MemoryPackWriter<TBufferWriter>")}} writer, {{scopedRef}} {{TypeName}} value, uint id) {{(context.IsForUnity ? "" : (context.IsNet7OrGreater ? "where TBufferWriter : System.Buffers.IBufferWriter<byte>" : "where TBufferWriter : class, System.Buffers.IBufferWriter<byte>"))}}
+    {
+{{circularSerializeBodyMethod}}
+    }
+
+    // Singleton dispatcher used by the writer's deferred-body queue. WriteBody is generic over
+    // TBufferWriter (inherited from the base class), so the same dispatcher works for any buffer.
+    [global::MemoryPack.Internal.Preserve]
+    sealed class {{Symbol.Name}}DeferredBodyWriter : global::MemoryPack.MemoryPackDeferredBodyWriter
+    {
+        public static readonly {{Symbol.Name}}DeferredBodyWriter Instance = new {{Symbol.Name}}DeferredBodyWriter();
+
+        public override void WriteBody<TBufferWriter>(ref MemoryPackWriter<TBufferWriter> writer, object value, uint id)
+        {
+            var typed = ({{TypeName}})value;
+            {{TypeName}}.SerializeBody(ref writer, ref typed, id);
+        }
+    }
+""" : "")}}
 }
 """);
 
@@ -495,23 +533,46 @@ partial {{classOrStructOrRecord}} {{TypeName}}
         }
         if (GenerateType == GenerateType.CircularReference)
         {
+            // Cycle marker (or deferred reference): the body bytes are either earlier in the
+            // stream (cycle) or in the deferred-blocks tail (defer). Either way we look up the
+            // id; on miss, pre-construct a placeholder so deferred bodies have something to
+            // populate when the drain loop reaches them.
             circularReferenceBody = $$"""
         uint id;
         if (count == MemoryPackCode.ReferenceId)
         {
             id = reader.ReadVarIntUInt32();
-            value = ({{TypeName}})reader.OptionalState.GetObjectReference(id);
+            if (reader.OptionalState.TryGetObjectReference(id, out var __existing))
+            {
+                value = ({{TypeName}})__existing;
+            }
+            else
+            {
+                value = new {{TypeName}}();
+                reader.OptionalState.AddObjectReference(id, value);
+            }
             goto END;
         }
 """;
 
+            // Inline body: if id already in the table, the placeholder was created on an earlier
+            // cycle/defer-marker encounter — reuse it instead of constructing a duplicate. This
+            // path is also taken by the deferred-drain loop, where the placeholder is always
+            // present.
             circularReferenceBody2 = $$"""
         id = reader.ReadVarIntUInt32();
-        if (value == null)
+        if (reader.OptionalState.TryGetObjectReference(id, out var __existingBody))
         {
-            value = new {{TypeName}}();
+            value = ({{TypeName}})__existingBody;
         }
-        reader.OptionalState.AddObjectReference(id, value);
+        else
+        {
+            if (value == null)
+            {
+                value = new {{TypeName}}();
+            }
+            reader.OptionalState.AddObjectReference(id, value);
+        }
 """;
         }
 
@@ -677,16 +738,31 @@ partial {{classOrStructOrRecord}} {{TypeName}}
             ? "new MemoryPackWriter(ref System.Runtime.CompilerServices.Unsafe.As<global::MemoryPack.Internal.ReusableLinkedArrayBufferWriter, System.Buffers.IBufferWriter<byte>>(ref tempBuffer), writer.OptionalState)"
             : "new MemoryPackWriter<global::MemoryPack.Internal.ReusableLinkedArrayBufferWriter>(ref tempBuffer, writer.OptionalState)";
 
-        var checkCircularReference = "";
+        // For CircularReference: emit cycle check, defer-on-threshold branch, and delegate body to SerializeBody.
+        // SerializeBody and the dispatcher singleton are emitted as additional members of the partial class.
         if (GenerateType == GenerateType.CircularReference)
         {
-            checkCircularReference = """
+            return $$"""
+{{(!IsValueType ? $$"""
+        if (value == null)
+        {
+            writer.WriteNullObjectHeader();
+            goto END;
+        }
+""" : "")}}
         var (existsReference, id) = writer.OptionalState.GetOrAddReference(value);
         if (existsReference)
         {
             writer.WriteObjectReferenceId(id);
             goto END;
         }
+        if (writer.ShouldDefer)
+        {
+            writer.WriteObjectReferenceId(id);
+            writer.OptionalState.EnqueueDeferred(id, value, {{Symbol.Name}}DeferredBodyWriter.Instance);
+            goto END;
+        }
+        SerializeBody(ref writer, ref value, id);
 """;
         }
 
@@ -698,7 +774,6 @@ partial {{classOrStructOrRecord}} {{TypeName}}
             goto END;
         }
 """ : "")}}
-{{checkCircularReference}}
         var tempBuffer = global::MemoryPack.Internal.ReusableLinkedArrayBufferWriterPool.Rent();
         try
         {
@@ -723,7 +798,50 @@ partial {{classOrStructOrRecord}} {{TypeName}}
                 }
                 writer.WriteVarInt(delta);
             }
-            {{(GenerateType == GenerateType.CircularReference ? "writer.WriteVarInt(id);" : "")}}
+            tempBuffer.WriteToAndReset(ref writer);
+        }
+        finally
+        {
+            global::MemoryPack.Internal.ReusableLinkedArrayBufferWriterPool.Return(tempBuffer);
+        }
+""";
+    }
+
+    // Emits the body-only portion for CircularReference (non-optimized path) — the same bytes
+    // the inline path produced before, minus the cycle/defer guard. Called both directly from
+    // Serialize (when depth is below MaxDepth) and from the drain-loop dispatcher.
+    string EmitCircularReferenceSerializeBody(bool isForUnity)
+    {
+        var newTempWriter = isForUnity
+            ? "new MemoryPackWriter(ref System.Runtime.CompilerServices.Unsafe.As<global::MemoryPack.Internal.ReusableLinkedArrayBufferWriter, System.Buffers.IBufferWriter<byte>>(ref tempBuffer), writer.OptionalState)"
+            : "new MemoryPackWriter<global::MemoryPack.Internal.ReusableLinkedArrayBufferWriter>(ref tempBuffer, writer.OptionalState)";
+
+        return $$"""
+        var tempBuffer = global::MemoryPack.Internal.ReusableLinkedArrayBufferWriterPool.Rent();
+        try
+        {
+            Span<int> offsets = stackalloc int[{{Members.Length}}];
+            var tempWriter = {{newTempWriter}};
+
+{{EmitSerializeMembers(Members, "            ", toTempWriter: true, writeObjectHeader: false)}}
+
+            tempWriter.Flush();
+
+            writer.WriteObjectHeader({{Members.Length}});
+            for (int i = 0; i < {{Members.Length}}; i++)
+            {
+                int delta;
+                if (i == 0)
+                {
+                    delta = offsets[i];
+                }
+                else
+                {
+                    delta = offsets[i] - offsets[i - 1];
+                }
+                writer.WriteVarInt(delta);
+            }
+            writer.WriteVarInt(id);
             tempBuffer.WriteToAndReset(ref writer);
         }
         finally
@@ -746,16 +864,29 @@ partial {{classOrStructOrRecord}} {{TypeName}}
             return sb.ToString();
         }
 
-        var checkCircularReference = "";
         if (GenerateType == GenerateType.CircularReference)
         {
-            checkCircularReference = """
+            return $$"""
+{{(!IsValueType ? $$"""
+        if (value == null)
+        {
+            writer.WriteNullObjectHeader();
+            goto END;
+        }
+""" : "")}}
         var (existsReference, id) = writer.OptionalState.GetOrAddReference(value);
         if (existsReference)
         {
             writer.WriteObjectReferenceId(id);
             goto END;
         }
+        if (writer.ShouldDefer)
+        {
+            writer.WriteObjectReferenceId(id);
+            writer.OptionalState.EnqueueDeferred(id, value, {{Symbol.Name}}DeferredBodyWriter.Instance);
+            goto END;
+        }
+        SerializeBody(ref writer, ref value, id);
 """;
         }
 
@@ -767,10 +898,29 @@ partial {{classOrStructOrRecord}} {{TypeName}}
             goto END;
         }
 """ : "")}}
-{{checkCircularReference}}
         writer.WriteObjectHeader({{Members.Length}});
 {{EmitLengthHeader(Members)}}
-        {{(GenerateType == GenerateType.CircularReference ? "writer.WriteVarInt(id);" : "")}}
+{{EmitSerializeMembers(Members, "        ", toTempWriter: false, writeObjectHeader: false)}}
+""";
+    }
+
+    // Optimized body-only emit for CircularReference fixed-size members.
+    string EmitCircularReferenceSerializeBodyOptimized()
+    {
+        static string EmitLengthHeader(MemberMeta[] members)
+        {
+            var sb = new StringBuilder();
+            foreach (var item in members)
+            {
+                sb.AppendLine("        " + item.EmitVarIntLength());
+            }
+            return sb.ToString();
+        }
+
+        return $$"""
+        writer.WriteObjectHeader({{Members.Length}});
+{{EmitLengthHeader(Members)}}
+        writer.WriteVarInt(id);
 {{EmitSerializeMembers(Members, "        ", toTempWriter: false, writeObjectHeader: false)}}
 """;
     }

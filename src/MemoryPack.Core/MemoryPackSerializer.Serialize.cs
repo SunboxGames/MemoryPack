@@ -161,7 +161,33 @@ public static partial class MemoryPackSerializer
 #endif
     {
         writer.WriteValue(value);
+        DrainDeferred(ref writer);
         writer.Flush();
+    }
+
+    // Drain the writer's defer queue iteratively. Each entry represents a CircularReference object
+    // whose body was deferred at the recursion threshold; we now write it as [id varint][full body]
+    // appended to the stream. Bodies may enqueue further entries during their own write — the loop
+    // continues until the queue is fully drained. A final uint.MaxValue varint marks end-of-defer.
+    // Skipped entirely if no references were ever assigned (non-CircularReference types unaffected).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void DrainDeferred<TBufferWriter>(ref MemoryPackWriter<TBufferWriter> writer)
+#if NET7_0_OR_GREATER
+        where TBufferWriter : IBufferWriter<byte>
+#else
+        where TBufferWriter : class, IBufferWriter<byte>
+#endif
+    {
+        var state = writer.OptionalState;
+        if (state == MemoryPackWriterOptionalState.NullState) return;
+        if (!state.HasReferences) return;
+
+        while (state.TryDequeueDeferred(out var entry))
+        {
+            writer.WriteVarInt(entry.Id);
+            entry.Dispatcher.WriteBody(ref writer, entry.Value, entry.Id);
+        }
+        writer.WriteVarInt(uint.MaxValue);
     }
 
     public static async ValueTask SerializeAsync<T>(Stream stream, T? value, MemoryPackSerializerOptions? options = default, CancellationToken cancellationToken = default)

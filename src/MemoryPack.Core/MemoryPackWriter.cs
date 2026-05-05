@@ -33,7 +33,7 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
 #endif
     int bufferLength;
     int advancedCount;
-    int depth; // check recursive serialize
+    // Recursion depth lives on the shared OptionalState (not here) so temp sub-writers share it.
     int writtenCount;
     readonly bool serializeStringAsUtf8;
     readonly MemoryPackWriterOptionalState optionalState;
@@ -42,6 +42,15 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
     public int BufferLength => bufferLength;
     public MemoryPackWriterOptionalState OptionalState => optionalState;
     public MemoryPackSerializerOptions Options => optionalState.Options;
+
+    // True when the current depth has reached the configured MaxDepth threshold.
+    // Source-generated CircularReference Serialize methods consult this to decide whether
+    // to recurse inline (fast path) or enqueue the body for iterative drain (deep path).
+    public bool ShouldDefer
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => optionalState.Depth >= optionalState.Options.MaxDepth;
+    }
 
     public MemoryPackWriter(ref TBufferWriter writer, MemoryPackWriterOptionalState optionalState)
     {
@@ -55,7 +64,6 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         this.bufferLength = 0;
         this.advancedCount = 0;
         this.writtenCount = 0;
-        this.depth = 0;
         this.serializeStringAsUtf8 = optionalState.Options.StringEncoding == StringEncoding.Utf8;
         this.optionalState = optionalState;
     }
@@ -73,7 +81,6 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         this.bufferLength = firstBufferOfWriter.Length;
         this.advancedCount = 0;
         this.writtenCount = 0;
-        this.depth = 0;
         this.serializeStringAsUtf8 = optionalState.Options.StringEncoding == StringEncoding.Utf8;
         this.optionalState = optionalState;
     }
@@ -90,7 +97,6 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         this.bufferLength = firstBufferOfWriter.Length;
         this.advancedCount = 0;
         this.writtenCount = 0;
-        this.depth = 0;
         this.serializeStringAsUtf8 = optionalState.Options.StringEncoding == StringEncoding.Utf8;
         this.optionalState = optionalState;
     }
@@ -403,10 +409,10 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
     public void WritePackable<T>(scoped in T? value)
         where T : IMemoryPackable<T>
     {
-        depth++;
-        if (depth == DepthLimit) MemoryPackSerializationException.ThrowReachedDepthLimit(typeof(T));
+        var d = ++optionalState.Depth;
+        if (d == DepthLimit) MemoryPackSerializationException.ThrowReachedDepthLimit(typeof(T));
         T.Serialize(ref this, ref Unsafe.AsRef(in value));
-        depth--;
+        optionalState.Depth--;
     }
 
 #else
@@ -424,28 +430,28 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void WriteValue<T>(scoped in T? value)
     {
-        depth++;
-        if (depth == DepthLimit) MemoryPackSerializationException.ThrowReachedDepthLimit(typeof(T));
+        var d = ++optionalState.Depth;
+        if (d == DepthLimit) MemoryPackSerializationException.ThrowReachedDepthLimit(typeof(T));
         GetFormatter<T>().Serialize(ref this, ref Unsafe.AsRef(in value));
-        depth--;
+        optionalState.Depth--;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void WriteValue(Type type, object? value)
     {
-        depth++;
-        if (depth == DepthLimit) MemoryPackSerializationException.ThrowReachedDepthLimit(type);
+        var d = ++optionalState.Depth;
+        if (d == DepthLimit) MemoryPackSerializationException.ThrowReachedDepthLimit(type);
         GetFormatter(type).Serialize(ref this, ref value);
-        depth--;
+        optionalState.Depth--;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void WriteValueWithFormatter<TFormatter, T>(TFormatter formatter, scoped in T? value)
         where TFormatter : IMemoryPackFormatter<T>
     {
-        depth++;
+        ++optionalState.Depth;
         formatter.Serialize(ref this, ref Unsafe.AsRef(in value));
-        depth--;
+        optionalState.Depth--;
     }
 
     #region WriteArray/Span
@@ -465,11 +471,10 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
             return;
         }
 
-        var formatter = GetFormatter<T>();
         WriteCollectionHeader(value.Length);
         for (int i = 0; i < value.Length; i++)
         {
-            formatter.Serialize(ref this, ref value[i]);
+            WriteValue(value[i]);
         }
     }
 
@@ -482,11 +487,10 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
             return;
         }
 
-        var formatter = GetFormatter<T>();
         WriteCollectionHeader(value.Length);
         for (int i = 0; i < value.Length; i++)
         {
-            formatter.Serialize(ref this, ref value[i]);
+            WriteValue(value[i]);
         }
     }
 
@@ -499,11 +503,10 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
             return;
         }
 
-        var formatter = GetFormatter<T>();
         WriteCollectionHeader(value.Length);
         for (int i = 0; i < value.Length; i++)
         {
-            formatter.Serialize(ref this, ref Unsafe.AsRef(in value[i]));
+            WriteValue(value[i]);
         }
     }
 
@@ -531,7 +534,7 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         WriteCollectionHeader(value.Length);
         for (int i = 0; i < value.Length; i++)
         {
-            T.Serialize(ref this, ref value[i]);
+            WritePackable(value[i]);
         }
 #endif
     }
@@ -553,7 +556,7 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         WriteCollectionHeader(value.Length);
         for (int i = 0; i < value.Length; i++)
         {
-            T.Serialize(ref this, ref value[i]);
+            WritePackable(value[i]);
         }
 #endif
     }
@@ -575,7 +578,7 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         WriteCollectionHeader(value.Length);
         for (int i = 0; i < value.Length; i++)
         {
-            T.Serialize(ref this, ref Unsafe.AsRef(in value[i]));
+            WritePackable(value[i]);
         }
 #endif
     }
@@ -694,10 +697,9 @@ public ref partial struct MemoryPackWriter<TBufferWriter>
         }
         else
         {
-            var formatter = GetFormatter<T>();
             for (int i = 0; i < value.Length; i++)
             {
-                formatter.Serialize(ref this, ref Unsafe.AsRef(in value[i]));
+                WriteValue(value[i]);
             }
         }
     }

@@ -29,6 +29,10 @@ public sealed class MemoryPackReaderOptionalState : IDisposable
     readonly Dictionary<uint, object> refToObject;
     public MemoryPackSerializerOptions Options { get; private set; }
 
+    // True once any CircularReference object has been registered during this deserialize call.
+    // Used by the top-level drain loop to decide whether to read the deferred-block stream.
+    public bool HasReferences => refToObject.Count > 0;
+
     internal MemoryPackReaderOptionalState()
     {
         refToObject = new Dictionary<uint, object>();
@@ -48,6 +52,17 @@ public sealed class MemoryPackReaderOptionalState : IDisposable
         }
         MemoryPackSerializationException.ThrowMessage("Object is not found in this reference id:" + id);
         return null!;
+    }
+
+    public bool TryGetObjectReference(uint id, out object value)
+    {
+        if (refToObject.TryGetValue(id, out var existing))
+        {
+            value = existing;
+            return true;
+        }
+        value = null!;
+        return false;
     }
 
     public void AddObjectReference(uint id, object value)

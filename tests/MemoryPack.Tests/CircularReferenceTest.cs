@@ -151,4 +151,136 @@ public class CircularReferenceTest
         tylerDeserialized?.DirectReports?[0].Manager.Should().BeSameAs(tylerDeserialized);
     }
 
+    // Builds a chain of `length` nodes and verifies round-trip without StackOverflow.
+    static LinkedNode BuildLinkedList(int length)
+    {
+        LinkedNode head = new() { Value = 0 };
+        var current = head;
+        for (int i = 1; i < length; i++)
+        {
+            var next = new LinkedNode { Value = i };
+            current.Next = next;
+            current = next;
+        }
+        return head;
+    }
+
+    static int CountAndVerifyChain(LinkedNode? head)
+    {
+        int count = 0;
+        var current = head;
+        while (current != null)
+        {
+            current.Value.Should().Be(count);
+            count++;
+            current = current.Next;
+        }
+        return count;
+    }
+
+    [Fact]
+    public void DeepLinkedList_PastDefaultThreshold()
+    {
+        // 5,000 nodes — well past the default MaxDepth of 512, exercises defer + drain.
+        const int length = 5_000;
+        var head = BuildLinkedList(length);
+
+        var bin = MemoryPackSerializer.Serialize(head);
+        var deserialized = MemoryPackSerializer.Deserialize<LinkedNode>(bin);
+
+        CountAndVerifyChain(deserialized).Should().Be(length);
+    }
+
+    [Fact]
+    public void DeepLinkedList_VeryLong()
+    {
+        // 100,000 nodes — would StackOverflow without defer.
+        const int length = 100_000;
+        var head = BuildLinkedList(length);
+
+        var bin = MemoryPackSerializer.Serialize(head);
+        var deserialized = MemoryPackSerializer.Deserialize<LinkedNode>(bin);
+
+        CountAndVerifyChain(deserialized).Should().Be(length);
+    }
+
+    [Fact]
+    public void DeepLinkedList_TightThreshold()
+    {
+        // Force defer to fire frequently with MaxDepth=4. Stresses the drain machinery.
+        const int length = 1_000;
+        var head = BuildLinkedList(length);
+
+        var options = MemoryPackSerializerOptions.Default with { MaxDepth = 4 };
+        var bin = MemoryPackSerializer.Serialize(head, options);
+        var deserialized = MemoryPackSerializer.Deserialize<LinkedNode>(bin, options);
+
+        CountAndVerifyChain(deserialized).Should().Be(length);
+    }
+
+    [Fact]
+    public void DeepBinaryTree()
+    {
+        // Balanced binary tree with depth 14 = 16,383 nodes. Exercises defer with wide fan-out.
+        TreeNode Build(int depth, int seed)
+        {
+            var node = new TreeNode { Value = seed };
+            if (depth <= 0) return node;
+            node.Left = Build(depth - 1, seed * 2 + 1);
+            node.Right = Build(depth - 1, seed * 2 + 2);
+            return node;
+        }
+        bool Equal(TreeNode? a, TreeNode? b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a == null || b == null) return false;
+            return a.Value == b.Value && Equal(a.Left, b.Left) && Equal(a.Right, b.Right);
+        }
+
+        var root = Build(13, 0);
+        var bin = MemoryPackSerializer.Serialize(root);
+        var deserialized = MemoryPackSerializer.Deserialize<TreeNode>(bin);
+
+        Equal(root, deserialized).Should().BeTrue();
+    }
+
+    [Fact]
+    public void CyclePastThreshold()
+    {
+        // Build a chain of 1000, then close the cycle: last.Next = head. Must round-trip
+        // with cycle preserved despite passing MaxDepth=512 mid-chain.
+        const int length = 1_000;
+        var head = BuildLinkedList(length);
+        var tail = head;
+        while (tail.Next != null) tail = tail.Next;
+        tail.Next = head;
+
+        var bin = MemoryPackSerializer.Serialize(head);
+        var deserialized = MemoryPackSerializer.Deserialize<LinkedNode>(bin)!;
+
+        // Walk `length` nodes, then verify we're back at head.
+        var current = deserialized;
+        for (int i = 0; i < length - 1; i++) current = current.Next!;
+        current.Next.Should().BeSameAs(deserialized);
+    }
+
+    [Fact]
+    public void PlainObject_DeepChain_Throws()
+    {
+        // Plain GenerateType.Object types don't participate in defer — they should hit the
+        // hard DepthLimit guard and throw cleanly rather than StackOverflow.
+        const int length = 2_000;
+        PlainLinkedNode head = new() { Value = 0 };
+        var current = head;
+        for (int i = 1; i < length; i++)
+        {
+            var next = new PlainLinkedNode { Value = i };
+            current.Next = next;
+            current = next;
+        }
+
+        Action act = () => MemoryPackSerializer.Serialize(head);
+        act.Should().Throw<MemoryPackSerializationException>();
+    }
+
 }

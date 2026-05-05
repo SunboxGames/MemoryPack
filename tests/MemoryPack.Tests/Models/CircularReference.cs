@@ -53,3 +53,30 @@ public partial class SequentialCircularReference
     public SequentialCircularReference? Manager { get; set; }
     public List<SequentialCircularReference>? DirectReports { get; set; }
 }
+
+[MemoryPackable(GenerateType.CircularReference)]
+public partial class LinkedNode
+{
+    [MemoryPackOrder(0)]
+    public int Value { get; set; }
+    [MemoryPackOrder(1)]
+    public LinkedNode? Next { get; set; }
+}
+
+[MemoryPackable(GenerateType.CircularReference)]
+public partial class TreeNode
+{
+    [MemoryPackOrder(0)]
+    public int Value { get; set; }
+    [MemoryPackOrder(1)]
+    public TreeNode? Left { get; set; }
+    [MemoryPackOrder(2)]
+    public TreeNode? Right { get; set; }
+}
+
+[MemoryPackable]
+public partial class PlainLinkedNode
+{
+    public int Value { get; set; }
+    public PlainLinkedNode? Next { get; set; }
+}

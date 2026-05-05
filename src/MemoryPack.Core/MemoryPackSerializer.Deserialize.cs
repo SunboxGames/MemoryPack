@@ -49,6 +49,7 @@ public static partial class MemoryPackSerializer
         try
         {
             reader.ReadValue(ref value);
+            DrainDeferred(ref reader);
             return reader.Consumed;
         }
         finally
@@ -131,12 +132,36 @@ public static partial class MemoryPackSerializer
         try
         {
             reader.ReadValue(ref value);
+            DrainDeferred(ref reader);
             return reader.Consumed;
         }
         finally
         {
             reader.Dispose();
             state.Reset();
+        }
+    }
+
+    // Drain the deferred-block stream emitted by the writer's defer queue. Each block is
+    // [id varint][full object body]. The placeholder for that id was pre-constructed when
+    // the inline cycle/defer marker was first read, so we look it up by runtime type and
+    // invoke the existing per-type Deserialize to populate its fields. Skips entirely when
+    // no references exist (non-CircularReference deserializations are byte-identical).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void DrainDeferred(ref MemoryPackReader reader)
+    {
+        var state = reader.OptionalState;
+        if (!state.HasReferences) return;
+
+        while (true)
+        {
+            var blockId = reader.ReadVarIntUInt32();
+            if (blockId == uint.MaxValue) break;
+
+            var placeholder = state.GetObjectReference(blockId);
+            var formatter = MemoryPackFormatterProvider.GetFormatter(placeholder.GetType());
+            object? boxed = placeholder;
+            formatter.Deserialize(ref reader, ref boxed);
         }
     }
 
